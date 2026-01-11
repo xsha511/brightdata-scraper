@@ -1,215 +1,161 @@
-"""Amazon scraper implementation."""
+"""Amazon scraper using BrightData Web Scraper API."""
 
-import re
-import json
-from typing import Optional
-from urllib.parse import urlencode, quote_plus
+from typing import Any, Optional
 
 from .base import BaseScraper
-from ..models import Product, ProductImage, SearchResult
+from ..config import config
+from ..models import Product, ProductImage
 
 
 class AmazonScraper(BaseScraper):
-    """Scraper for Amazon products."""
+    """
+    Scraper for Amazon products using BrightData's Amazon dataset.
+
+    BrightData provides pre-built Amazon scrapers that handle:
+    - Product search by keyword
+    - Product details by URL or ASIN
+    - Price, reviews, images, and more
+
+    Dataset documentation:
+    https://docs.brightdata.com/scraping-automation/web-data-apis/web-scraper-api/datasets/amazon
+    """
 
     platform = "amazon"
-    BASE_URL = "https://www.amazon.com"
 
-    async def search(self, query: str, page: int = 1) -> SearchResult:
-        """Search Amazon for products."""
-        params = {
-            "k": query,
-            "page": page,
-        }
-        url = f"{self.BASE_URL}/s?{urlencode(params)}"
+    def __init__(self, client=None):
+        super().__init__(client)
+        self.dataset_id = config.amazon_dataset_id
 
-        html = await self.client.get_html(url)
-        products = self._parse_search_results(html)
+    def build_search_input(self, query: str, **kwargs) -> list[dict]:
+        """
+        Build input for Amazon search.
 
-        return SearchResult(
-            query=query,
-            platform=self.platform,
-            products=products,
-            next_page_url=f"{self.BASE_URL}/s?{urlencode({'k': query, 'page': page + 1})}",
-        )
+        BrightData Amazon dataset accepts:
+        - keyword: Search keyword
+        - url: Direct product or search URL
+        - asin: Amazon product ID
+        - pages_to_search: Number of search result pages
+        """
+        pages = kwargs.get("pages", 1)
+        country = kwargs.get("country", "us")
 
-    async def get_product(self, product_id: str) -> Optional[Product]:
-        """Get Amazon product by ASIN."""
-        url = f"{self.BASE_URL}/dp/{product_id}"
-        html = await self.client.get_html(url)
-        return self.parse_product_html(html, url)
+        return [{
+            "keyword": query,
+            "pages_to_search": pages,
+            "country": country,
+        }]
 
-    def _parse_search_results(self, html: str) -> list[Product]:
-        """Parse search results page."""
+    def build_product_input(self, product_id: str, **kwargs) -> list[dict]:
+        """
+        Build input for Amazon product detail.
+
+        Can use ASIN or full URL.
+        """
+        country = kwargs.get("country", "us")
+
+        # If it looks like a URL, use url parameter
+        if product_id.startswith("http"):
+            return [{"url": product_id, "country": country}]
+
+        # Otherwise assume it's an ASIN
+        return [{"asin": product_id, "country": country}]
+
+    def parse_api_response(self, data: Any) -> list[Product]:
+        """
+        Parse BrightData Amazon API response.
+
+        The API returns structured data with fields like:
+        - asin, title, brand, price, rating, reviews_count
+        - images (list), description, features
+        - seller info, availability, etc.
+        """
+        if not data:
+            return []
+
+        # Handle both single item and list responses
+        items = data if isinstance(data, list) else [data]
         products = []
 
-        # Extract product cards using regex patterns
-        # Pattern for data-asin attribute
-        asin_pattern = r'data-asin="([A-Z0-9]{10})"'
-        asins = set(re.findall(asin_pattern, html))
-
-        for asin in asins:
-            if not asin:
-                continue
-
-            # Try to extract basic info from search result
-            product = self._extract_search_product(html, asin)
+        for item in items:
+            product = self._parse_item(item)
             if product:
                 products.append(product)
 
         return products
 
-    def _extract_search_product(self, html: str, asin: str) -> Optional[Product]:
-        """Extract product info from search results."""
-        # Find the section containing this ASIN
-        pattern = rf'data-asin="{asin}"[^>]*>(.*?)</div>\s*</div>\s*</div>'
-        match = re.search(pattern, html, re.DOTALL)
+    def _parse_item(self, item: dict) -> Optional[Product]:
+        """Parse a single item from API response."""
+        try:
+            asin = item.get("asin") or item.get("product_id") or ""
+            if not asin:
+                return None
 
-        if not match:
-            # Create minimal product with just the ASIN
+            # Parse images
+            images = []
+            image_data = item.get("images") or item.get("image_urls") or []
+            if isinstance(image_data, str):
+                image_data = [image_data]
+
+            for i, img in enumerate(image_data):
+                img_url = img if isinstance(img, str) else img.get("url", "")
+                if img_url:
+                    images.append(ProductImage(url=img_url, is_primary=i == 0))
+
+            # Main image fallback
+            main_image = item.get("image") or item.get("main_image")
+            if main_image and not any(img.url == main_image for img in images):
+                images.insert(0, ProductImage(url=main_image, is_primary=True))
+                if len(images) > 1:
+                    images[1].is_primary = False
+
+            # Parse price
+            price = None
+            price_val = item.get("price") or item.get("final_price")
+            if price_val:
+                if isinstance(price_val, (int, float)):
+                    price = float(price_val)
+                elif isinstance(price_val, str):
+                    # Remove currency symbol and parse
+                    price_str = price_val.replace("$", "").replace(",", "").strip()
+                    try:
+                        price = float(price_str)
+                    except ValueError:
+                        pass
+
+            # Parse rating
+            rating = None
+            rating_val = item.get("rating") or item.get("stars")
+            if rating_val:
+                try:
+                    rating = float(rating_val)
+                except (ValueError, TypeError):
+                    pass
+
+            # Parse review count
+            review_count = None
+            reviews = item.get("reviews_count") or item.get("ratings_total")
+            if reviews:
+                try:
+                    review_count = int(reviews)
+                except (ValueError, TypeError):
+                    pass
+
             return Product(
                 platform=self.platform,
                 product_id=asin,
-                url=f"{self.BASE_URL}/dp/{asin}",
-                title=f"Amazon Product {asin}",
+                url=item.get("url") or f"https://www.amazon.com/dp/{asin}",
+                title=item.get("title") or item.get("name") or f"Amazon Product {asin}",
+                price=price,
+                original_price=item.get("original_price"),
+                currency=item.get("currency", "USD"),
+                rating=rating,
+                review_count=review_count,
+                description=item.get("description") or item.get("product_description"),
+                images=images,
+                seller=item.get("seller") or item.get("sold_by"),
+                category=item.get("category") or item.get("breadcrumbs"),
+                in_stock=item.get("availability", "").lower() != "out of stock",
             )
-
-        section = match.group(1)
-
-        # Extract title
-        title_match = re.search(
-            r'<span[^>]*class="[^"]*a-text-normal[^"]*"[^>]*>([^<]+)</span>', section
-        )
-        title = title_match.group(1).strip() if title_match else f"Amazon Product {asin}"
-
-        # Extract price
-        price = None
-        price_match = re.search(r'<span class="a-price-whole">([0-9,]+)</span>', section)
-        if price_match:
-            price_str = price_match.group(1).replace(",", "")
-            try:
-                price = float(price_str)
-            except ValueError:
-                pass
-
-        # Extract image
-        images = []
-        img_match = re.search(r'<img[^>]*src="([^"]+)"[^>]*class="[^"]*s-image[^"]*"', section)
-        if img_match:
-            images.append(ProductImage(url=img_match.group(1), is_primary=True))
-
-        # Extract rating
-        rating = None
-        rating_match = re.search(r'<span class="a-icon-alt">([0-9.]+) out of 5', section)
-        if rating_match:
-            try:
-                rating = float(rating_match.group(1))
-            except ValueError:
-                pass
-
-        return Product(
-            platform=self.platform,
-            product_id=asin,
-            url=f"{self.BASE_URL}/dp/{asin}",
-            title=title,
-            price=price,
-            rating=rating,
-            images=images,
-        )
-
-    def parse_product_html(self, html: str, url: str) -> Optional[Product]:
-        """Parse Amazon product detail page."""
-        # Extract ASIN from URL
-        asin_match = re.search(r"/dp/([A-Z0-9]{10})", url)
-        if not asin_match:
+        except Exception as e:
+            print(f"Error parsing Amazon item: {e}")
             return None
-        asin = asin_match.group(1)
-
-        # Extract title
-        title_match = re.search(r'<span[^>]*id="productTitle"[^>]*>([^<]+)</span>', html)
-        title = title_match.group(1).strip() if title_match else f"Amazon Product {asin}"
-
-        # Extract price
-        price = None
-        price_patterns = [
-            r'<span class="a-price-whole">([0-9,]+)</span>',
-            r'"priceAmount":([0-9.]+)',
-            r'<span[^>]*id="priceblock_ourprice"[^>]*>\$([0-9,.]+)</span>',
-        ]
-        for pattern in price_patterns:
-            match = re.search(pattern, html)
-            if match:
-                price_str = match.group(1).replace(",", "")
-                try:
-                    price = float(price_str)
-                    break
-                except ValueError:
-                    continue
-
-        # Extract images
-        images = self._extract_product_images(html)
-
-        # Extract rating
-        rating = None
-        rating_match = re.search(r'"acrPopover"[^>]*title="([0-9.]+) out of 5', html)
-        if rating_match:
-            try:
-                rating = float(rating_match.group(1))
-            except ValueError:
-                pass
-
-        # Extract review count
-        review_count = None
-        review_match = re.search(r'"acrCustomerReviewText"[^>]*>([0-9,]+) ratings', html)
-        if review_match:
-            try:
-                review_count = int(review_match.group(1).replace(",", ""))
-            except ValueError:
-                pass
-
-        # Extract description
-        description = None
-        desc_match = re.search(
-            r'<div[^>]*id="productDescription"[^>]*>.*?<p[^>]*>([^<]+)</p>', html, re.DOTALL
-        )
-        if desc_match:
-            description = desc_match.group(1).strip()
-
-        return Product(
-            platform=self.platform,
-            product_id=asin,
-            url=url,
-            title=title,
-            price=price,
-            rating=rating,
-            review_count=review_count,
-            description=description,
-            images=images,
-        )
-
-    def _extract_product_images(self, html: str) -> list[ProductImage]:
-        """Extract product images from detail page."""
-        images = []
-
-        # Try to find image data in JavaScript
-        img_data_match = re.search(r"'colorImages':\s*\{\s*'initial':\s*(\[.*?\])\s*\}", html)
-        if img_data_match:
-            try:
-                img_data = json.loads(img_data_match.group(1))
-                for i, img in enumerate(img_data):
-                    if "hiRes" in img and img["hiRes"]:
-                        images.append(ProductImage(url=img["hiRes"], is_primary=i == 0))
-                    elif "large" in img and img["large"]:
-                        images.append(ProductImage(url=img["large"], is_primary=i == 0))
-            except json.JSONDecodeError:
-                pass
-
-        # Fallback: extract from img tags
-        if not images:
-            img_matches = re.findall(
-                r'<img[^>]*id="landingImage"[^>]*src="([^"]+)"', html
-            )
-            for i, img_url in enumerate(img_matches):
-                images.append(ProductImage(url=img_url, is_primary=i == 0))
-
-        return images

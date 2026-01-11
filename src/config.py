@@ -1,7 +1,7 @@
 """Configuration management."""
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -9,36 +9,37 @@ load_dotenv()
 
 @dataclass
 class BrightDataConfig:
-    """BrightData configuration."""
+    """BrightData Web Scraper API configuration."""
 
-    # Proxy authentication
-    username: str = os.getenv("BRIGHTDATA_USERNAME", "")
-    password: str = os.getenv("BRIGHTDATA_PASSWORD", "")
-    host: str = os.getenv("BRIGHTDATA_HOST", "brd.superproxy.io")
-    port: int = int(os.getenv("BRIGHTDATA_PORT", "22225"))
+    # Web Scraper API token (Bearer token)
+    api_token: str = os.getenv("BRIGHTDATA_API_TOKEN", "")
 
-    # Zone-based auth (alternative)
-    zone: str = os.getenv("BRIGHTDATA_ZONE", "")
-    customer_id: str = os.getenv("BRIGHTDATA_CUSTOMER_ID", "")
+    # Dataset IDs for different platforms
+    # These are BrightData's pre-built scraper IDs
+    amazon_dataset_id: str = os.getenv(
+        "BRIGHTDATA_AMAZON_DATASET_ID",
+        "gd_l7q7dkf244hwjntr0"  # Amazon Products dataset
+    )
+    temu_dataset_id: str = os.getenv(
+        "BRIGHTDATA_TEMU_DATASET_ID",
+        "gd_lz6e6n1k2pgo51vy9d"  # Temu Products dataset (if available)
+    )
 
-    # Web Scraper API
-    scraper_api_key: str = os.getenv("BRIGHTDATA_SCRAPER_API_KEY", "")
-
-    @property
-    def proxy_url(self) -> str:
-        """Get proxy URL for requests."""
-        if self.zone and self.customer_id:
-            auth = f"brd-customer-{self.customer_id}-zone-{self.zone}"
-            return f"http://{auth}:{self.password}@{self.host}:{self.port}"
-        return f"http://{self.username}:{self.password}@{self.host}:{self.port}"
+    # API endpoints
+    api_base_url: str = "https://api.brightdata.com/datasets/v3"
 
     @property
     def is_configured(self) -> bool:
-        """Check if BrightData is properly configured."""
-        has_proxy = bool(self.username and self.password)
-        has_zone = bool(self.zone and self.customer_id and self.password)
-        has_api = bool(self.scraper_api_key)
-        return has_proxy or has_zone or has_api
+        """Check if BrightData API is properly configured."""
+        return bool(self.api_token)
+
+    @property
+    def auth_headers(self) -> dict:
+        """Get authentication headers for API requests."""
+        return {
+            "Authorization": f"Bearer {self.api_token}",
+            "Content-Type": "application/json",
+        }
 
 
 @dataclass
@@ -48,8 +49,9 @@ class ScraperConfig:
     data_dir: str = "data"
     images_dir: str = "data/images"
     max_retries: int = 3
-    timeout: int = 30
+    timeout: int = 120  # API requests may take longer
     concurrent_requests: int = 5
+    poll_interval: int = 10  # Seconds between status checks
 
 
 config = BrightDataConfig()

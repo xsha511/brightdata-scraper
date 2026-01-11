@@ -1,16 +1,17 @@
-"""Base scraper class."""
+"""Base scraper class for BrightData Web Scraper API."""
 
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, Any
 
 from ..client import BrightDataClient
 from ..models import Product, SearchResult
 
 
 class BaseScraper(ABC):
-    """Abstract base class for platform scrapers."""
+    """Abstract base class for platform scrapers using BrightData API."""
 
     platform: str = "unknown"
+    dataset_id: str = ""
 
     def __init__(self, client: Optional[BrightDataClient] = None):
         self._client = client
@@ -33,16 +34,41 @@ class BaseScraper(ABC):
         return self._client
 
     @abstractmethod
-    async def search(self, query: str, page: int = 1) -> SearchResult:
-        """Search for products."""
+    def build_search_input(self, query: str, **kwargs) -> list[dict]:
+        """Build input payload for search request."""
         pass
 
     @abstractmethod
-    async def get_product(self, product_id: str) -> Optional[Product]:
-        """Get product details by ID."""
+    def build_product_input(self, product_id: str, **kwargs) -> list[dict]:
+        """Build input payload for product detail request."""
         pass
 
     @abstractmethod
-    def parse_product_html(self, html: str, url: str) -> Optional[Product]:
-        """Parse product from HTML."""
+    def parse_api_response(self, data: Any) -> list[Product]:
+        """Parse API response into Product models."""
         pass
+
+    async def search(self, query: str, **kwargs) -> SearchResult:
+        """Search for products using BrightData API."""
+        inputs = self.build_search_input(query, **kwargs)
+        data = await self.client.collect_and_wait(self.dataset_id, inputs)
+        products = self.parse_api_response(data)
+
+        return SearchResult(
+            query=query,
+            platform=self.platform,
+            products=products,
+        )
+
+    async def get_product(self, product_id: str, **kwargs) -> Optional[Product]:
+        """Get product details using BrightData API."""
+        inputs = self.build_product_input(product_id, **kwargs)
+        data = await self.client.collect_and_wait(self.dataset_id, inputs)
+        products = self.parse_api_response(data)
+        return products[0] if products else None
+
+    async def get_products_by_urls(self, urls: list[str]) -> list[Product]:
+        """Get multiple products by their URLs."""
+        inputs = [{"url": url} for url in urls]
+        data = await self.client.collect_and_wait(self.dataset_id, inputs)
+        return self.parse_api_response(data)
