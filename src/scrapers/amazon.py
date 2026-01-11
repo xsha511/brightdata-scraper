@@ -1,92 +1,86 @@
-"""Amazon scraper using BrightData Web Scraper API."""
+"""Amazon scraper using BrightData SDK."""
 
 from typing import Any, Optional
 
 from .base import BaseScraper
-from ..config import config
-from ..models import Product, ProductImage
+from ..models import Product, ProductImage, SearchResult
 
 
 class AmazonScraper(BaseScraper):
     """
-    Scraper for Amazon products using BrightData's Amazon dataset.
+    Scraper for Amazon products using BrightData's official SDK.
 
-    BrightData provides pre-built Amazon scrapers that handle:
-    - Product search by keyword
-    - Product details by URL or ASIN
-    - Price, reviews, images, and more
-
-    Dataset documentation:
-    https://docs.brightdata.com/scraping-automation/web-data-apis/web-scraper-api/datasets/amazon
+    The SDK handles authentication, rate limiting, and response parsing.
     """
 
     platform = "amazon"
 
-    def __init__(self, client=None):
-        super().__init__(client)
-        self.dataset_id = config.amazon_dataset_id
+    async def search(self, query: str, **kwargs) -> SearchResult:
+        """Search Amazon for products."""
+        data = await self.client.scrape_amazon_search(query)
+        products = self.parse_response(data)
 
-    def build_search_input(self, query: str, **kwargs) -> list[dict]:
-        """
-        Build input for Amazon search.
+        return SearchResult(
+            query=query,
+            platform=self.platform,
+            products=products,
+        )
 
-        BrightData Amazon dataset accepts:
-        - keyword: Search keyword
-        - url: Direct product or search URL
-        - asin: Amazon product ID
-        - pages_to_search: Number of search result pages
-        """
-        pages = kwargs.get("pages", 1)
-        country = kwargs.get("country", "us")
-
-        return [{
-            "keyword": query,
-            "pages_to_search": pages,
-            "country": country,
-        }]
-
-    def build_product_input(self, product_id: str, **kwargs) -> list[dict]:
-        """
-        Build input for Amazon product detail.
-
-        Can use ASIN or full URL.
-        """
-        country = kwargs.get("country", "us")
-
-        # If it looks like a URL, use url parameter
+    async def get_product(self, product_id: str, **kwargs) -> Optional[Product]:
+        """Get Amazon product by ASIN or URL."""
+        # If it's a URL, extract ASIN or use directly
         if product_id.startswith("http"):
-            return [{"url": product_id, "country": country}]
+            data = await self.client.scrape_url(product_id)
+        else:
+            data = await self.client.scrape_amazon_product(product_id)
 
-        # Otherwise assume it's an ASIN
-        return [{"asin": product_id, "country": country}]
+        products = self.parse_response(data)
+        return products[0] if products else None
 
-    def parse_api_response(self, data: Any) -> list[Product]:
-        """
-        Parse BrightData Amazon API response.
+    async def get_products_by_urls(self, urls: list[str]) -> list[Product]:
+        """Get multiple products by their URLs."""
+        all_products = []
+        for url in urls:
+            data = await self.client.scrape_url(url)
+            products = self.parse_response(data)
+            all_products.extend(products)
+        return all_products
 
-        The API returns structured data with fields like:
-        - asin, title, brand, price, rating, reviews_count
-        - images (list), description, features
-        - seller info, availability, etc.
-        """
+    def parse_response(self, data: Any) -> list[Product]:
+        """Parse BrightData SDK response into Product models."""
         if not data:
             return []
 
-        # Handle both single item and list responses
-        items = data if isinstance(data, list) else [data]
-        products = []
+        # Handle SDK response format
+        # The SDK may return data in different formats
+        items = []
 
+        if hasattr(data, 'data'):
+            items = data.data if isinstance(data.data, list) else [data.data]
+        elif isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = [data]
+
+        products = []
         for item in items:
-            product = self._parse_item(item)
-            if product:
-                products.append(product)
+            if isinstance(item, dict):
+                product = self._parse_item(item)
+                if product:
+                    products.append(product)
 
         return products
 
     def _parse_item(self, item: dict) -> Optional[Product]:
-        """Parse a single item from API response."""
+        """Parse a single item from SDK response."""
         try:
-            asin = item.get("asin") or item.get("product_id") or ""
+            # Extract ASIN
+            asin = (
+                item.get("asin") or
+                item.get("product_id") or
+                item.get("id") or
+                ""
+            )
             if not asin:
                 return None
 
@@ -102,25 +96,14 @@ class AmazonScraper(BaseScraper):
                     images.append(ProductImage(url=img_url, is_primary=i == 0))
 
             # Main image fallback
-            main_image = item.get("image") or item.get("main_image")
+            main_image = item.get("image") or item.get("main_image") or item.get("thumbnail")
             if main_image and not any(img.url == main_image for img in images):
                 images.insert(0, ProductImage(url=main_image, is_primary=True))
                 if len(images) > 1:
                     images[1].is_primary = False
 
             # Parse price
-            price = None
-            price_val = item.get("price") or item.get("final_price")
-            if price_val:
-                if isinstance(price_val, (int, float)):
-                    price = float(price_val)
-                elif isinstance(price_val, str):
-                    # Remove currency symbol and parse
-                    price_str = price_val.replace("$", "").replace(",", "").strip()
-                    try:
-                        price = float(price_str)
-                    except ValueError:
-                        pass
+            price = self._parse_price(item.get("price") or item.get("final_price"))
 
             # Parse rating
             rating = None
@@ -133,7 +116,7 @@ class AmazonScraper(BaseScraper):
 
             # Parse review count
             review_count = None
-            reviews = item.get("reviews_count") or item.get("ratings_total")
+            reviews = item.get("reviews_count") or item.get("ratings_total") or item.get("reviews")
             if reviews:
                 try:
                     review_count = int(reviews)
@@ -142,11 +125,11 @@ class AmazonScraper(BaseScraper):
 
             return Product(
                 platform=self.platform,
-                product_id=asin,
+                product_id=str(asin),
                 url=item.get("url") or f"https://www.amazon.com/dp/{asin}",
                 title=item.get("title") or item.get("name") or f"Amazon Product {asin}",
                 price=price,
-                original_price=item.get("original_price"),
+                original_price=self._parse_price(item.get("original_price")),
                 currency=item.get("currency", "USD"),
                 rating=rating,
                 review_count=review_count,
@@ -154,8 +137,25 @@ class AmazonScraper(BaseScraper):
                 images=images,
                 seller=item.get("seller") or item.get("sold_by"),
                 category=item.get("category") or item.get("breadcrumbs"),
-                in_stock=item.get("availability", "").lower() != "out of stock",
+                in_stock=str(item.get("availability", "")).lower() != "out of stock",
             )
         except Exception as e:
             print(f"Error parsing Amazon item: {e}")
             return None
+
+    def _parse_price(self, price_val: Any) -> Optional[float]:
+        """Parse price from various formats."""
+        if price_val is None:
+            return None
+
+        if isinstance(price_val, (int, float)):
+            return float(price_val)
+
+        if isinstance(price_val, str):
+            price_str = price_val.replace("$", "").replace(",", "").strip()
+            try:
+                return float(price_str)
+            except ValueError:
+                return None
+
+        return None

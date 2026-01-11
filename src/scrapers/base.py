@@ -1,4 +1,4 @@
-"""Base scraper class for BrightData Web Scraper API."""
+"""Base scraper class using BrightData SDK."""
 
 from abc import ABC, abstractmethod
 from typing import Optional, Any
@@ -8,10 +8,9 @@ from ..models import Product, SearchResult
 
 
 class BaseScraper(ABC):
-    """Abstract base class for platform scrapers using BrightData API."""
+    """Abstract base class for platform scrapers using BrightData SDK."""
 
     platform: str = "unknown"
-    dataset_id: str = ""
 
     def __init__(self, client: Optional[BrightDataClient] = None):
         self._client = client
@@ -34,41 +33,16 @@ class BaseScraper(ABC):
         return self._client
 
     @abstractmethod
-    def build_search_input(self, query: str, **kwargs) -> list[dict]:
-        """Build input payload for search request."""
-        pass
-
-    @abstractmethod
-    def build_product_input(self, product_id: str, **kwargs) -> list[dict]:
-        """Build input payload for product detail request."""
-        pass
-
-    @abstractmethod
-    def parse_api_response(self, data: Any) -> list[Product]:
-        """Parse API response into Product models."""
-        pass
-
     async def search(self, query: str, **kwargs) -> SearchResult:
-        """Search for products using BrightData API."""
-        inputs = self.build_search_input(query, **kwargs)
-        data = await self.client.collect_and_wait(self.dataset_id, inputs)
-        products = self.parse_api_response(data)
+        """Search for products."""
+        pass
 
-        return SearchResult(
-            query=query,
-            platform=self.platform,
-            products=products,
-        )
-
+    @abstractmethod
     async def get_product(self, product_id: str, **kwargs) -> Optional[Product]:
-        """Get product details using BrightData API."""
-        inputs = self.build_product_input(product_id, **kwargs)
-        data = await self.client.collect_and_wait(self.dataset_id, inputs)
-        products = self.parse_api_response(data)
-        return products[0] if products else None
+        """Get product details by ID."""
+        pass
 
-    async def get_products_by_urls(self, urls: list[str]) -> list[Product]:
-        """Get multiple products by their URLs."""
-        inputs = [{"url": url} for url in urls]
-        data = await self.client.collect_and_wait(self.dataset_id, inputs)
-        return self.parse_api_response(data)
+    @abstractmethod
+    def parse_response(self, data: Any) -> list[Product]:
+        """Parse SDK response into Product models."""
+        pass

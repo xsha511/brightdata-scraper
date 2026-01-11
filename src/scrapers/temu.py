@@ -1,86 +1,77 @@
-"""Temu scraper using BrightData Web Scraper API."""
+"""Temu scraper using BrightData SDK."""
 
+import re
 from typing import Any, Optional
 
 from .base import BaseScraper
-from ..config import config
-from ..models import Product, ProductImage
+from ..models import Product, ProductImage, SearchResult
 
 
 class TemuScraper(BaseScraper):
     """
-    Scraper for Temu products using BrightData's Temu dataset.
+    Scraper for Temu products using BrightData's official SDK.
 
-    BrightData provides pre-built Temu scrapers that handle:
-    - Product search by keyword
-    - Product details by URL
-    - Price, images, and product info
-
-    Note: Check BrightData's dataset marketplace for the latest
-    Temu dataset ID and available fields.
+    The SDK handles authentication, rate limiting, and response parsing.
     """
 
     platform = "temu"
 
-    def __init__(self, client=None):
-        super().__init__(client)
-        self.dataset_id = config.temu_dataset_id
+    async def search(self, query: str, **kwargs) -> SearchResult:
+        """Search Temu for products."""
+        data = await self.client.scrape_temu_search(query)
+        products = self.parse_response(data)
 
-    def build_search_input(self, query: str, **kwargs) -> list[dict]:
-        """
-        Build input for Temu search.
+        return SearchResult(
+            query=query,
+            platform=self.platform,
+            products=products,
+        )
 
-        BrightData Temu dataset accepts:
-        - keyword: Search keyword
-        - url: Direct product or search URL
-        """
-        # Build search URL for Temu
-        search_url = f"https://www.temu.com/search_result.html?search_key={query}"
-
-        return [{
-            "url": search_url,
-            "keyword": query,
-        }]
-
-    def build_product_input(self, product_id: str, **kwargs) -> list[dict]:
-        """
-        Build input for Temu product detail.
-
-        Can use product ID or full URL.
-        """
-        # If it looks like a URL, use it directly
+    async def get_product(self, product_id: str, **kwargs) -> Optional[Product]:
+        """Get Temu product by ID or URL."""
         if product_id.startswith("http"):
-            return [{"url": product_id}]
+            data = await self.client.scrape_url(product_id)
+        else:
+            data = await self.client.scrape_temu_product(product_id)
 
-        # Otherwise build URL from product ID
-        url = f"https://www.temu.com/{product_id}.html"
-        return [{"url": url}]
+        products = self.parse_response(data)
+        return products[0] if products else None
 
-    def parse_api_response(self, data: Any) -> list[Product]:
-        """
-        Parse BrightData Temu API response.
+    async def get_products_by_urls(self, urls: list[str]) -> list[Product]:
+        """Get multiple products by their URLs."""
+        all_products = []
+        for url in urls:
+            data = await self.client.scrape_url(url)
+            products = self.parse_response(data)
+            all_products.extend(products)
+        return all_products
 
-        The API returns structured data with fields like:
-        - product_id, title, price
-        - images (list)
-        - seller info, etc.
-        """
+    def parse_response(self, data: Any) -> list[Product]:
+        """Parse BrightData SDK response into Product models."""
         if not data:
             return []
 
-        # Handle both single item and list responses
-        items = data if isinstance(data, list) else [data]
-        products = []
+        # Handle SDK response format
+        items = []
 
+        if hasattr(data, 'data'):
+            items = data.data if isinstance(data.data, list) else [data.data]
+        elif isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = [data]
+
+        products = []
         for item in items:
-            product = self._parse_item(item)
-            if product:
-                products.append(product)
+            if isinstance(item, dict):
+                product = self._parse_item(item)
+                if product:
+                    products.append(product)
 
         return products
 
     def _parse_item(self, item: dict) -> Optional[Product]:
-        """Parse a single item from API response."""
+        """Parse a single item from SDK response."""
         try:
             # Extract product ID
             product_id = str(
@@ -94,8 +85,6 @@ class TemuScraper(BaseScraper):
             if not product_id:
                 url = item.get("url", "")
                 if url:
-                    # Extract ID from URL like /12345.html
-                    import re
                     match = re.search(r"/(\d+)\.html", url)
                     if match:
                         product_id = match.group(1)
@@ -117,12 +106,11 @@ class TemuScraper(BaseScraper):
             for i, img in enumerate(image_data):
                 img_url = img if isinstance(img, str) else img.get("url", "")
                 if img_url:
-                    # Ensure full URL
                     if not img_url.startswith("http"):
                         img_url = f"https:{img_url}"
                     images.append(ProductImage(url=img_url, is_primary=i == 0))
 
-            # Main image/thumbnail fallback
+            # Main image fallback
             main_image = (
                 item.get("image") or
                 item.get("main_image") or
@@ -138,38 +126,11 @@ class TemuScraper(BaseScraper):
                         images[1].is_primary = False
 
             # Parse price
-            price = None
-            price_val = (
+            price = self._parse_price(
                 item.get("price") or
                 item.get("sale_price") or
                 item.get("current_price")
             )
-            if price_val:
-                if isinstance(price_val, (int, float)):
-                    # Temu sometimes stores price in cents
-                    price = float(price_val)
-                    if price > 1000:  # Likely in cents
-                        price = price / 100
-                elif isinstance(price_val, str):
-                    price_str = price_val.replace("$", "").replace(",", "").strip()
-                    try:
-                        price = float(price_str)
-                    except ValueError:
-                        pass
-
-            # Parse original price
-            original_price = None
-            orig_val = item.get("original_price") or item.get("list_price")
-            if orig_val:
-                if isinstance(orig_val, (int, float)):
-                    original_price = float(orig_val)
-                    if original_price > 1000:
-                        original_price = original_price / 100
-                elif isinstance(orig_val, str):
-                    try:
-                        original_price = float(orig_val.replace("$", "").replace(",", ""))
-                    except ValueError:
-                        pass
 
             # Build URL
             url = item.get("url")
@@ -187,7 +148,7 @@ class TemuScraper(BaseScraper):
                     f"Temu Product {product_id}"
                 ),
                 price=price,
-                original_price=original_price,
+                original_price=self._parse_price(item.get("original_price") or item.get("list_price")),
                 currency="USD",
                 rating=item.get("rating"),
                 review_count=item.get("reviews_count") or item.get("sold_count"),
@@ -195,8 +156,29 @@ class TemuScraper(BaseScraper):
                 images=images,
                 seller=item.get("seller") or item.get("shop_name"),
                 category=item.get("category"),
-                in_stock=True,  # Temu doesn't always provide this
+                in_stock=True,
             )
         except Exception as e:
             print(f"Error parsing Temu item: {e}")
             return None
+
+    def _parse_price(self, price_val: Any) -> Optional[float]:
+        """Parse price from various formats."""
+        if price_val is None:
+            return None
+
+        if isinstance(price_val, (int, float)):
+            price = float(price_val)
+            # Temu sometimes stores price in cents
+            if price > 1000:
+                price = price / 100
+            return price
+
+        if isinstance(price_val, str):
+            price_str = price_val.replace("$", "").replace(",", "").strip()
+            try:
+                return float(price_str)
+            except ValueError:
+                return None
+
+        return None
