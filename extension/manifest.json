@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Temu Data Collector",
+  "version": "1.0.0",
+  "description": "Collect product data from Temu pages",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://*.temu.com/*"
+  ],
+  "background": {
+    "service_worker": "background/service-worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*.temu.com/*"],
+      "js": ["content/main.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "Temu Collector"
+  }
+}
