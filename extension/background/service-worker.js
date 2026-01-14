@@ -3,11 +3,16 @@
  * Background service worker for batch uploads and heartbeat.
  */
 
-importScripts('../utils/storage.js');
+import { DataQueue } from '../utils/storage.js';
 
 const queue = new DataQueue();
 const BATCH_INTERVAL_MINUTES = 1;
-const SERVER_URL = 'http://localhost:8000';
+const DEFAULT_SERVER_URL = 'http://localhost:8000';
+
+async function getServerUrl() {
+  const result = await chrome.storage.local.get('serverUrl');
+  return result.serverUrl || DEFAULT_SERVER_URL;
+}
 
 // Set up periodic batch upload
 chrome.alarms.create('batchUpload', { periodInMinutes: BATCH_INTERVAL_MINUTES });
@@ -22,8 +27,10 @@ async function processBatchUpload() {
   const items = await queue.dequeueAll(50);
   if (items.length === 0) return;
 
+  const serverUrl = await getServerUrl();
+
   try {
-    const response = await fetch(`${SERVER_URL}/api/collect/batch`, {
+    const response = await fetch(`${serverUrl}/api/collect/batch`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ products: items }),

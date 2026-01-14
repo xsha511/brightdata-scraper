@@ -39,7 +39,5 @@ class DataQueue {
   }
 }
 
-// Export for use in background script
-if (typeof self !== 'undefined') {
-  self.DataQueue = DataQueue;
-}
+// Export for ES modules
+export { DataQueue };
