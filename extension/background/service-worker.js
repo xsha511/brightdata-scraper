@@ -684,10 +684,17 @@ async function extractXuanpinViaDebugger(tabId, maxRetries = 3) {
           networkData.push({ type: 'network_capture_error', error: e.message });
         }
 
-        // ========== 提取当前显示的图表数据 ==========
-        let chartHistoryData = [];
-        let chartDebugInfo = { method: 'echarts_api', started: true };
-        console.log('[Debugger] Starting chart extraction via ECharts API...');
+        // ========== 提取所有图表数据（4个标签：总销量、日销量、销售额、价格） ==========
+        const allChartData = {
+          total_sales: [],    // 总销量
+          daily_sales: [],    // 日销量
+          revenue: [],        // 销售额
+          price: []           // 价格
+        };
+        const chartTypes = ['total_sales', 'daily_sales', 'revenue', 'price'];
+        const chartLabels = ['总销量', '日销量', '销售额', '价格'];
+        let chartDebugInfo = { method: 'multi_chart', started: true, charts: {} };
+        console.log('[Debugger] Starting multi-chart extraction...');
 
         // 方法1：在所有执行上下文中查找 ECharts 实例
         try {
@@ -796,21 +803,101 @@ async function extractXuanpinViaDebugger(tabId, maxRetries = 3) {
           chartDebugInfo.echartsError = e.message;
         }
 
+        // 提取单个图表数据的函数
+        async function extractSingleChart(chartX, chartY, chartWidth, chartHeight, chartType) {
+          const chartData = [];
+          const startX = chartX + 60, endX = chartX + chartWidth - 10;
+          const y = chartY + chartHeight / 2;
+          const numSamples = 31;
+          const step = (endX - startX) / (numSamples - 1);
+
+          for (let i = 0; i < numSamples; i++) {
+            const x = startX + i * step;
+
+            await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+              type: 'mouseMoved', x: Math.round(x), y: Math.round(y), button: 'none', buttons: 0
+            });
+
+            await new Promise(r => setTimeout(r, 120));
+
+            // 使用 DOM.performSearch 查找 tooltip
+            let tooltipText = null;
+            const searchQueries = [
+              'div[style*="position: absolute"][style*="z-index"]',
+              'div[style*="position:absolute"]',
+              '[class*="tooltip"]',
+              'div[style*="pointer-events"]'
+            ];
+
+            for (const query of searchQueries) {
+              try {
+                const search = await chrome.debugger.sendCommand({ tabId }, 'DOM.performSearch', {
+                  query: query, includeUserAgentShadowDOM: true
+                });
+
+                if (search.resultCount > 0) {
+                  const results = await chrome.debugger.sendCommand({ tabId }, 'DOM.getSearchResults', {
+                    searchId: search.searchId, fromIndex: 0, toIndex: Math.min(search.resultCount, 10)
+                  });
+
+                  for (const nodeId of results.nodeIds) {
+                    try {
+                      const htmlResult = await chrome.debugger.sendCommand({ tabId }, 'DOM.getOuterHTML', { nodeId });
+                      const html = htmlResult.outerHTML || '';
+                      const text = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+
+                      if (text && text.length > 5 && text.length < 300) {
+                        const hasDate = /\d{1,2}[-\/]\d{1,2}/.test(text);
+                        const hasKeyword = /销量|销售额|价格|总计|日期/.test(text);
+
+                        if (hasDate || hasKeyword) {
+                          if (!tooltipText) tooltipText = text;
+                          break;
+                        }
+                      }
+                    } catch (e) {}
+                  }
+                  await chrome.debugger.sendCommand({ tabId }, 'DOM.discardSearchResults', { searchId: search.searchId }).catch(() => {});
+                }
+              } catch (e) {}
+              if (tooltipText) break;
+            }
+
+            if (tooltipText && !chartData.some(d => d.text === tooltipText)) {
+              const dateMatch = tooltipText.match(/(\d{1,2}[-\/]\d{1,2})/);
+              let valueMatch = tooltipText.match(/销售额[：:]\s*([\d,.]+)/) ||
+                               tooltipText.match(/销量[：:]\s*([\d,]+)/) ||
+                               tooltipText.match(/价格[：:]\s*([\d,.]+)/) ||
+                               tooltipText.match(/[：:]\s*([\d,.]+)/);
+              if (!valueMatch) {
+                const allNumbers = tooltipText.match(/[\d,.]+/g);
+                if (allNumbers && allNumbers.length > 1) valueMatch = [null, allNumbers[allNumbers.length - 1]];
+              }
+              chartData.push({
+                text: tooltipText,
+                date: dateMatch ? dateMatch[1] : null,
+                value: valueMatch ? valueMatch[1].replace(/,/g, '') : null,
+                x: Math.round(x)
+              });
+            }
+          }
+
+          // 移开鼠标
+          await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: 0, y: 0 });
+          return chartData;
+        }
+
         try {
           // 查找图表
           const chartSearch = await chrome.debugger.sendCommand({ tabId }, 'DOM.performSearch', {
-            query: '.chart',
-            includeUserAgentShadowDOM: true
+            query: '.chart', includeUserAgentShadowDOM: true
           });
-
           chartDebugInfo.chartSearchCount = chartSearch.resultCount;
 
           let chartNodeId = null;
           if (chartSearch.resultCount > 0) {
             const chartNodes = await chrome.debugger.sendCommand({ tabId }, 'DOM.getSearchResults', {
-              searchId: chartSearch.searchId,
-              fromIndex: 0,
-              toIndex: 1
+              searchId: chartSearch.searchId, fromIndex: 0, toIndex: 1
             });
             chartNodeId = chartNodes.nodeIds[0];
             await chrome.debugger.sendCommand({ tabId }, 'DOM.discardSearchResults', { searchId: chartSearch.searchId });
@@ -823,132 +910,91 @@ async function extractXuanpinViaDebugger(tabId, maxRetries = 3) {
               const content = boxModel.model.content;
               const chartX = content[0], chartY = content[1];
               const chartWidth = content[2] - content[0], chartHeight = content[5] - content[1];
-
               chartDebugInfo.chartPos = { x: chartX, y: chartY, width: chartWidth, height: chartHeight };
 
               // 启用 Input 域
               await chrome.debugger.sendCommand({ tabId }, 'Input.enable').catch(() => {});
 
-              // 沿图表 X 轴移动鼠标采样
-              const startX = chartX + 60, endX = chartX + chartWidth - 10;
-              const y = chartY + chartHeight / 2;
-              const numSamples = 31;
-              const step = (endX - startX) / (numSamples - 1);
+              // 查找所有图表标签 (.filter-item)
+              const tabSearch = await chrome.debugger.sendCommand({ tabId }, 'DOM.performSearch', {
+                query: '.filter-item', includeUserAgentShadowDOM: true
+              });
+              chartDebugInfo.tabCount = tabSearch.resultCount;
 
-              chartDebugInfo.sampling = { startX, endX, y, step, numSamples };
-
-              // 更多 tooltip 选择器，覆盖各种可能的样式
-              const tooltipSelectors = [
-                'div[style*="z-index: 9999999"]',
-                'div[style*="z-index: 999999"]',
-                'div[style*="z-index: 99999"]',
-                'div[style*="position: absolute"][style*="pointer-events"]',
-                'div[style*="position: absolute"][style*="left:"][style*="top:"]',
-                '.echarts-tooltip',
-                '[class*="tooltip"]',
-                '[class*="Tooltip"]'
-              ];
-
-              for (let i = 0; i < numSamples; i++) {
-                const x = startX + i * step;
-
-                await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
-                  type: 'mouseMoved', x: Math.round(x), y: Math.round(y), button: 'none', buttons: 0
+              let tabNodeIds = [];
+              if (tabSearch.resultCount >= 4) {
+                const tabNodes = await chrome.debugger.sendCommand({ tabId }, 'DOM.getSearchResults', {
+                  searchId: tabSearch.searchId, fromIndex: 0, toIndex: 4
                 });
+                tabNodeIds = tabNodes.nodeIds;
+                await chrome.debugger.sendCommand({ tabId }, 'DOM.discardSearchResults', { searchId: tabSearch.searchId });
+              }
 
-                await new Promise(r => setTimeout(r, 150));
+              console.log('[Debugger] Found', tabNodeIds.length, 'chart tabs');
 
-                // 使用 DOM.performSearch 查找 tooltip（可以跨 Shadow DOM 和扩展上下文）
-                let tooltipText = null;
-                let tooltipDebug = { selectors: [], found: [] };
+              // 遍历每个标签
+              for (let tabIdx = 0; tabIdx < chartTypes.length && tabIdx < tabNodeIds.length; tabIdx++) {
+                const chartType = chartTypes[tabIdx];
+                const chartLabel = chartLabels[tabIdx];
 
-                // ECharts tooltip 的常见选择器
-                const searchQueries = [
-                  'div[style*="position: absolute"][style*="z-index"]',
-                  'div[style*="position:absolute"]',
-                  '.ec-tooltip',
-                  '[class*="tooltip"]',
-                  'div[style*="pointer-events"]'
-                ];
+                console.log(`[Debugger] Extracting chart ${tabIdx + 1}/4: ${chartLabel}`);
 
-                for (const query of searchQueries) {
+                // 点击标签切换图表（第一个标签默认已激活，跳过点击）
+                if (tabIdx > 0) {
                   try {
-                    const search = await chrome.debugger.sendCommand({ tabId }, 'DOM.performSearch', {
-                      query: query,
-                      includeUserAgentShadowDOM: true
-                    });
+                    const tabBoxModel = await chrome.debugger.sendCommand({ tabId }, 'DOM.getBoxModel', { nodeId: tabNodeIds[tabIdx] });
+                    if (tabBoxModel.model) {
+                      const tabContent = tabBoxModel.model.content;
+                      const tabCenterX = (tabContent[0] + tabContent[2]) / 2;
+                      const tabCenterY = (tabContent[1] + tabContent[5]) / 2;
 
-                    tooltipDebug.selectors.push({ query, count: search.resultCount });
-
-                    if (search.resultCount > 0) {
-                      const results = await chrome.debugger.sendCommand({ tabId }, 'DOM.getSearchResults', {
-                        searchId: search.searchId,
-                        fromIndex: 0,
-                        toIndex: Math.min(search.resultCount, 10)
+                      // 点击标签
+                      await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+                        type: 'mousePressed', x: Math.round(tabCenterX), y: Math.round(tabCenterY), button: 'left', clickCount: 1
+                      });
+                      await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', {
+                        type: 'mouseReleased', x: Math.round(tabCenterX), y: Math.round(tabCenterY), button: 'left', clickCount: 1
                       });
 
-                      for (const nodeId of results.nodeIds) {
-                        try {
-                          const htmlResult = await chrome.debugger.sendCommand({ tabId }, 'DOM.getOuterHTML', { nodeId });
-                          const html = htmlResult.outerHTML || '';
-                          // 提取纯文本
-                          const text = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+                      console.log(`[Debugger] Clicked tab ${chartLabel} at (${Math.round(tabCenterX)}, ${Math.round(tabCenterY)})`);
 
-                          // 检查是否包含日期格式和数字（tooltip 特征）
-                          if (text && text.length > 5 && text.length < 300) {
-                            const hasDate = /\d{1,2}[-\/]\d{1,2}/.test(text);
-                            const hasNumber = /\d+/.test(text);
-                            const hasKeyword = /销量|销售额|价格|总计|日期/.test(text);
-
-                            if (hasDate || hasKeyword) {
-                              tooltipDebug.found.push({ text: text.substring(0, 80), hasDate, hasKeyword });
-
-                              if (!tooltipText) {
-                                tooltipText = text;
-                              }
-                            }
-                          }
-                        } catch (e) {}
-                      }
-
-                      await chrome.debugger.sendCommand({ tabId }, 'DOM.discardSearchResults', { searchId: search.searchId }).catch(() => {});
+                      // 等待图表刷新
+                      await new Promise(r => setTimeout(r, 600));
                     }
                   } catch (e) {
-                    tooltipDebug.selectors.push({ query, error: e.message });
+                    console.log(`[Debugger] Failed to click tab ${chartLabel}:`, e.message);
+                    chartDebugInfo.charts[chartType] = { error: 'click_failed', message: e.message };
+                    continue;
                   }
-
-                  if (tooltipText) break;
                 }
 
-                // 第一次循环时记录调试信息
-                if (i === 0) {
-                  chartDebugInfo.tooltipDebug = tooltipDebug;
-                }
-
-                if (tooltipText && !chartHistoryData.some(d => d.text === tooltipText)) {
-                  const dateMatch = tooltipText.match(/(\d{1,2}[-\/]\d{1,2})/);
-                  let valueMatch = tooltipText.match(/销售额[：:]\s*([\d,.]+)/) || tooltipText.match(/销量[：:]\s*([\d,]+)/) || tooltipText.match(/[：:]\s*([\d,.]+)/);
-                  if (!valueMatch) {
-                    const allNumbers = tooltipText.match(/[\d,.]+/g);
-                    if (allNumbers && allNumbers.length > 1) valueMatch = [null, allNumbers[allNumbers.length - 1]];
-                  }
-                  chartHistoryData.push({
-                    text: tooltipText,
-                    date: dateMatch ? dateMatch[1] : null,
-                    value: valueMatch ? valueMatch[1].replace(/,/g, '') : null,
-                    x: Math.round(x)
-                  });
-                  console.log('[Debugger] Captured tooltip:', tooltipText.substring(0, 50));
+                // 提取当前图表数据
+                try {
+                  const chartData = await extractSingleChart(chartX, chartY, chartWidth, chartHeight, chartType);
+                  allChartData[chartType] = chartData;
+                  chartDebugInfo.charts[chartType] = { points: chartData.length };
+                  console.log(`[Debugger] ${chartLabel}: extracted ${chartData.length} points`);
+                } catch (e) {
+                  console.log(`[Debugger] Failed to extract ${chartLabel}:`, e.message);
+                  chartDebugInfo.charts[chartType] = { error: 'extract_failed', message: e.message };
                 }
               }
 
-              // 移开鼠标
-              await chrome.debugger.sendCommand({ tabId }, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: 0, y: 0 });
+              // 如果没有找到标签，回退到单图表模式
+              if (tabNodeIds.length === 0) {
+                console.log('[Debugger] No tabs found, falling back to single chart extraction');
+                const singleChartData = await extractSingleChart(chartX, chartY, chartWidth, chartHeight, 'total_sales');
+                allChartData.total_sales = singleChartData;
+                chartDebugInfo.charts.total_sales = { points: singleChartData.length, fallback: true };
+              }
             }
           }
 
-          chartDebugInfo.dataPointsCollected = chartHistoryData.length;
-          console.log('[Debugger] Chart extraction complete, points:', chartHistoryData.length);
+          // 计算总数据点
+          const totalPoints = Object.values(allChartData).reduce((sum, arr) => sum + arr.length, 0);
+          chartDebugInfo.totalPoints = totalPoints;
+          console.log('[Debugger] Multi-chart extraction complete, total points:', totalPoints);
+
         } catch (e) {
           console.log('[Debugger] Chart extraction failed:', e);
           chartDebugInfo.error = e.message;
@@ -956,12 +1002,17 @@ async function extractXuanpinViaDebugger(tabId, maxRetries = 3) {
 
         // 添加图表调试信息
         networkData.push({ type: 'chart_tooltip_debug', ...chartDebugInfo });
-        if (chartHistoryData.length > 0) {
-          networkData.push({ type: 'chart_tooltip_data', data: chartHistoryData });
+
+        // 添加各图表数据
+        for (const [chartType, data] of Object.entries(allChartData)) {
+          if (data.length > 0) {
+            networkData.push({ type: 'chart_data', chartType, data });
+          }
         }
 
         // 图表数据用于返回
-        chartData = { chartHistoryData, totalPoints: chartHistoryData.length };
+        const totalPoints = Object.values(allChartData).reduce((sum, arr) => sum + arr.length, 0);
+        chartData = { allChartData, totalPoints };
 
       } catch (e) {
         console.log('[Debugger] Chart/network data collection failed:', e);
