@@ -1,12 +1,19 @@
 {
   "manifest_version": 3,
   "name": "Temu Data Collector",
-  "version": "1.0.0",
+  "version": "1.8.6",
   "description": "Collect product data from Temu pages",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "permissions": [
     "storage",
     "activeTab",
-    "scripting"
+    "scripting",
+    "alarms",
+    "debugger"
   ],
   "host_permissions": [
     "https://*.temu.com/*"
@@ -18,12 +25,27 @@
   "content_scripts": [
     {
       "matches": ["https://*.temu.com/*"],
+      "js": ["content/early-injector.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://*.temu.com/*"],
       "js": ["content/main.js"],
       "run_at": "document_idle"
     }
   ],
+  "web_accessible_resources": [
+    {
+      "resources": ["content/page-bridge.js", "content/early-inject.js"],
+      "matches": ["https://*.temu.com/*"]
+    }
+  ],
   "action": {
     "default_popup": "popup/popup.html",
-    "default_title": "Temu Collector"
+    "default_title": "Temu Collector (Debugger)",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png"
+    }
   }
 }

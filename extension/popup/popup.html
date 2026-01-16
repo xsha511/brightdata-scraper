@@ -28,7 +28,7 @@
   </style>
 </head>
 <body>
-  <h1>Temu Data Collector</h1>
+  <h1>Temu Data Collector <span id="version" style="font-size: 12px; color: #999; font-weight: normal;"></span></h1>
 
   <div id="status" class="status disconnected">Checking connection...</div>
 
@@ -43,11 +43,14 @@
   </div>
 
   <div class="config">
-    <label>Server URL</label>
-    <input type="text" id="serverUrl" value="http://localhost:8000">
+    <label>Server URL (后端配置)</label>
+    <div id="serverUrl" style="padding: 8px; background: #f5f5f5; border-radius: 4px; font-size: 12px; word-break: break-all;">Loading...</div>
+    <div style="font-size: 11px; color: #999; margin-top: 4px;">
+      Last updated: <span id="configTime">-</span>
+    </div>
   </div>
 
-  <button id="saveConfig">Save Configuration</button>
+  <button id="refreshConfig">Refresh Config</button>
 
   <script src="popup.js"></script>
 </body>
