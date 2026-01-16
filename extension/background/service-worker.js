@@ -684,10 +684,79 @@ async function extractXuanpinViaDebugger(tabId, maxRetries = 3) {
           networkData.push({ type: 'network_capture_error', error: e.message });
         }
 
-        // ========== 提取当前显示的图表数据（简化版，只提取一个） ==========
+        // ========== 提取当前显示的图表数据 ==========
         let chartHistoryData = [];
-        let chartDebugInfo = { method: 'single_chart_extraction', started: true };
-        console.log('[Debugger] Starting single chart extraction...');
+        let chartDebugInfo = { method: 'echarts_api', started: true };
+        console.log('[Debugger] Starting chart extraction via ECharts API...');
+
+        // 方法1：直接调用 ECharts API 获取图表数据
+        try {
+          const echartsResult = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+            expression: `
+              (function() {
+                const result = { instances: [], data: null, error: null };
+                try {
+                  // 查找所有 ECharts 实例
+                  const charts = document.querySelectorAll('[_echarts_instance_]');
+                  result.instances = Array.from(charts).map(c => c.getAttribute('_echarts_instance_'));
+
+                  if (charts.length > 0) {
+                    // 获取第一个图表的实例
+                    const chartEl = charts[0];
+                    const instanceId = chartEl.getAttribute('_echarts_instance_');
+
+                    // 尝试通过 echarts.getInstanceByDom 获取实例
+                    if (typeof echarts !== 'undefined') {
+                      const instance = echarts.getInstanceByDom(chartEl);
+                      if (instance) {
+                        const option = instance.getOption();
+                        result.data = {
+                          series: option.series,
+                          xAxis: option.xAxis,
+                          yAxis: option.yAxis
+                        };
+                      }
+                    }
+
+                    // 备用：检查全局变量
+                    if (!result.data && window.__ECHARTS_INSTANCES__) {
+                      result.data = { global: Object.keys(window.__ECHARTS_INSTANCES__) };
+                    }
+                  }
+                } catch(e) {
+                  result.error = e.message;
+                }
+                return JSON.stringify(result);
+              })()
+            `,
+            returnByValue: true
+          });
+
+          if (echartsResult.result?.value) {
+            const parsed = JSON.parse(echartsResult.result.value);
+            chartDebugInfo.echartsAPI = parsed;
+
+            if (parsed.data?.series?.[0]?.data) {
+              const seriesData = parsed.data.series[0].data;
+              const xAxisData = parsed.data.xAxis?.[0]?.data || [];
+
+              for (let i = 0; i < seriesData.length; i++) {
+                const value = seriesData[i];
+                const date = xAxisData[i] || '';
+                if (value !== null && value !== undefined) {
+                  chartHistoryData.push({
+                    date: date,
+                    value: String(value),
+                    text: date + ': ' + value
+                  });
+                }
+              }
+              chartDebugInfo.echartsDataPoints = chartHistoryData.length;
+            }
+          }
+        } catch (e) {
+          chartDebugInfo.echartsError = e.message;
+        }
 
         try {
           // 查找图表
