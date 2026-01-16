@@ -105,3 +105,13 @@ SQLite 数据库位于 `data/temu.db`，主要表：
 ## Version Control
 
 修改插件后记得更新 `extension/manifest.json` 中的 `version` 字段，便于在 chrome://extensions 确认刷新成功。
+
+### 重要里程碑备份
+
+**每次取得重大进展时，必须：**
+1. 创建 zip 备份：`zip -r temu-collector-v{version}.zip extension/`
+2. 立即 commit 代码
+
+已备份的里程碑版本：
+- `temu-collector-v1.5.1.zip` ~ `v1.5.4.zip` - 早期版本
+- `temu-collector-v1.8.13.zip` - 图表数据提取成功（DOM.performSearch + 鼠标模拟）
