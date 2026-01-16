@@ -757,43 +757,73 @@ async function extractXuanpinViaDebugger(tabId, maxRetries = 3) {
                   const evalResult = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
                     expression: `
                       (function() {
+                        const debug = { shadowRoots: 0, checked: 0, found: [] };
+
                         // 递归搜索 Shadow DOM
-                        function findTooltipInShadow(root) {
+                        function findTooltipInShadow(root, depth = 0) {
+                          if (depth > 10) return null;  // 防止无限递归
+
                           // 搜索各种可能的 tooltip 选择器
                           const selectors = [
                             'div[style*="z-index: 9999999"]',
                             'div[style*="z-index: 999999"]',
+                            'div[style*="z-index: 99999"]',
                             '.echarts-tooltip',
                             '[class*="tooltip"]',
+                            '[class*="Tooltip"]',
+                            'div[style*="position: absolute"][style*="pointer-events: none"]',
                             'div[style*="position: absolute"][style*="left:"][style*="top:"]'
                           ];
+
                           for (const sel of selectors) {
-                            const el = root.querySelector(sel);
-                            if (el && el.innerText && el.innerText.trim().length > 3) {
-                              const text = el.innerText.trim();
-                              // 检查是否包含日期格式 (如 12-17)
-                              if (/\\d{1,2}[-\\/]\\d{1,2}/.test(text)) {
-                                return text;
+                            try {
+                              const els = root.querySelectorAll(sel);
+                              debug.checked += els.length;
+                              for (const el of els) {
+                                if (el && el.innerText && el.innerText.trim().length > 3 && el.innerText.trim().length < 300) {
+                                  const text = el.innerText.trim();
+                                  debug.found.push({ sel, text: text.substring(0, 50), len: text.length });
+                                  // 检查是否包含日期格式 (如 12-17 或 01/15)
+                                  if (/\\d{1,2}[-\\/]\\d{1,2}/.test(text)) {
+                                    return text;
+                                  }
+                                }
+                              }
+                            } catch(e) {}
+                          }
+
+                          // 搜索所有 shadow roots
+                          try {
+                            const allElements = root.querySelectorAll('*');
+                            for (const el of allElements) {
+                              if (el.shadowRoot) {
+                                debug.shadowRoots++;
+                                const found = findTooltipInShadow(el.shadowRoot, depth + 1);
+                                if (found) return found;
                               }
                             }
-                          }
-                          // 搜索所有 shadow roots
-                          const allElements = root.querySelectorAll('*');
-                          for (const el of allElements) {
-                            if (el.shadowRoot) {
-                              const found = findTooltipInShadow(el.shadowRoot);
-                              if (found) return found;
-                            }
-                          }
+                          } catch(e) {}
+
                           return null;
                         }
-                        return findTooltipInShadow(document);
+
+                        const result = findTooltipInShadow(document);
+                        return JSON.stringify({ text: result, debug });
                       })()
                     `,
                     returnByValue: true
                   });
                   if (evalResult.result?.value) {
-                    tooltipText = evalResult.result.value;
+                    try {
+                      const parsed = JSON.parse(evalResult.result.value);
+                      tooltipText = parsed.text;
+                      // 第一次循环时记录调试信息
+                      if (i === 0) {
+                        chartDebugInfo.evalDebug = parsed.debug;
+                      }
+                    } catch(e) {
+                      tooltipText = evalResult.result.value;
+                    }
                   }
                 } catch (e) {
                   // 备用：使用 DOM.performSearch
