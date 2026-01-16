@@ -751,64 +751,49 @@ async function extractXuanpinViaDebugger(tabId, maxRetries = 3) {
 
                 await new Promise(r => setTimeout(r, 150));
 
-                // 使用 Runtime.evaluate 在页面上下文中查找 tooltip（可以穿透 Shadow DOM）
+                // 使用 Runtime.evaluate 直接在 document.body 查找 ECharts tooltip
                 let tooltipText = null;
                 try {
                   const evalResult = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
                     expression: `
                       (function() {
-                        const debug = { shadowRoots: 0, checked: 0, found: [] };
+                        const debug = { checked: 0, found: [], bodyChildren: document.body.children.length };
 
-                        // 递归搜索 Shadow DOM
-                        function findTooltipInShadow(root, depth = 0) {
-                          if (depth > 10) return null;  // 防止无限递归
+                        // ECharts tooltip 通常直接添加到 body，有特定的样式
+                        // 搜索 body 下所有 position:absolute 的 div
+                        const allDivs = document.body.querySelectorAll('div');
+                        for (const div of allDivs) {
+                          const style = div.getAttribute('style') || '';
+                          const cls = div.className || '';
 
-                          // 搜索各种可能的 tooltip 选择器
-                          const selectors = [
-                            'div[style*="z-index: 9999999"]',
-                            'div[style*="z-index: 999999"]',
-                            'div[style*="z-index: 99999"]',
-                            '.echarts-tooltip',
-                            '[class*="tooltip"]',
-                            '[class*="Tooltip"]',
-                            'div[style*="position: absolute"][style*="pointer-events: none"]',
-                            'div[style*="position: absolute"][style*="left:"][style*="top:"]'
-                          ];
+                          // 检查是否可能是 tooltip
+                          const isTooltipLike = (
+                            style.includes('position: absolute') ||
+                            style.includes('position:absolute') ||
+                            cls.includes('tooltip') ||
+                            cls.includes('Tooltip') ||
+                            style.includes('z-index')
+                          );
 
-                          for (const sel of selectors) {
-                            try {
-                              const els = root.querySelectorAll(sel);
-                              debug.checked += els.length;
-                              for (const el of els) {
-                                if (el && el.innerText && el.innerText.trim().length > 3 && el.innerText.trim().length < 300) {
-                                  const text = el.innerText.trim();
-                                  debug.found.push({ sel, text: text.substring(0, 50), len: text.length });
-                                  // 检查是否包含日期格式 (如 12-17 或 01/15)
-                                  if (/\\d{1,2}[-\\/]\\d{1,2}/.test(text)) {
-                                    return text;
-                                  }
-                                }
-                              }
-                            } catch(e) {}
-                          }
+                          if (isTooltipLike && div.innerText) {
+                            const text = div.innerText.trim();
+                            if (text.length > 3 && text.length < 300) {
+                              debug.checked++;
+                              debug.found.push({
+                                cls: cls.substring(0, 30),
+                                style: style.substring(0, 50),
+                                text: text.substring(0, 60)
+                              });
 
-                          // 搜索所有 shadow roots
-                          try {
-                            const allElements = root.querySelectorAll('*');
-                            for (const el of allElements) {
-                              if (el.shadowRoot) {
-                                debug.shadowRoots++;
-                                const found = findTooltipInShadow(el.shadowRoot, depth + 1);
-                                if (found) return found;
+                              // 检查是否包含日期格式 (如 12-17, 01/15, 1-15)
+                              if (/\\d{1,2}[-\\/]\\d{1,2}/.test(text)) {
+                                return JSON.stringify({ text, debug });
                               }
                             }
-                          } catch(e) {}
-
-                          return null;
+                          }
                         }
 
-                        const result = findTooltipInShadow(document);
-                        return JSON.stringify({ text: result, debug });
+                        return JSON.stringify({ text: null, debug });
                       })()
                     `,
                     returnByValue: true
