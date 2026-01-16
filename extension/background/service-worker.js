@@ -858,91 +858,71 @@ async function extractXuanpinViaDebugger(tabId, maxRetries = 3) {
 
                 await new Promise(r => setTimeout(r, 150));
 
-                // 使用 Runtime.evaluate 直接在 document.body 查找 ECharts tooltip
+                // 使用 DOM.performSearch 查找 tooltip（可以跨 Shadow DOM 和扩展上下文）
                 let tooltipText = null;
-                try {
-                  const evalResult = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
-                    expression: `
-                      (function() {
-                        const debug = { checked: 0, found: [], bodyChildren: document.body.children.length };
+                let tooltipDebug = { selectors: [], found: [] };
 
-                        // ECharts tooltip 通常直接添加到 body，有特定的样式
-                        // 搜索 body 下所有 position:absolute 的 div
-                        const allDivs = document.body.querySelectorAll('div');
-                        for (const div of allDivs) {
-                          const style = div.getAttribute('style') || '';
-                          const cls = div.className || '';
+                // ECharts tooltip 的常见选择器
+                const searchQueries = [
+                  'div[style*="position: absolute"][style*="z-index"]',
+                  'div[style*="position:absolute"]',
+                  '.ec-tooltip',
+                  '[class*="tooltip"]',
+                  'div[style*="pointer-events"]'
+                ];
 
-                          // 检查是否可能是 tooltip
-                          const isTooltipLike = (
-                            style.includes('position: absolute') ||
-                            style.includes('position:absolute') ||
-                            cls.includes('tooltip') ||
-                            cls.includes('Tooltip') ||
-                            style.includes('z-index')
-                          );
+                for (const query of searchQueries) {
+                  try {
+                    const search = await chrome.debugger.sendCommand({ tabId }, 'DOM.performSearch', {
+                      query: query,
+                      includeUserAgentShadowDOM: true
+                    });
 
-                          if (isTooltipLike && div.innerText) {
-                            const text = div.innerText.trim();
-                            if (text.length > 3 && text.length < 300) {
-                              debug.checked++;
-                              debug.found.push({
-                                cls: cls.substring(0, 30),
-                                style: style.substring(0, 50),
-                                text: text.substring(0, 60)
-                              });
+                    tooltipDebug.selectors.push({ query, count: search.resultCount });
 
-                              // 检查是否包含日期格式 (如 12-17, 01/15, 1-15)
-                              if (/\\d{1,2}[-\\/]\\d{1,2}/.test(text)) {
-                                return JSON.stringify({ text, debug });
+                    if (search.resultCount > 0) {
+                      const results = await chrome.debugger.sendCommand({ tabId }, 'DOM.getSearchResults', {
+                        searchId: search.searchId,
+                        fromIndex: 0,
+                        toIndex: Math.min(search.resultCount, 10)
+                      });
+
+                      for (const nodeId of results.nodeIds) {
+                        try {
+                          const htmlResult = await chrome.debugger.sendCommand({ tabId }, 'DOM.getOuterHTML', { nodeId });
+                          const html = htmlResult.outerHTML || '';
+                          // 提取纯文本
+                          const text = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+
+                          // 检查是否包含日期格式和数字（tooltip 特征）
+                          if (text && text.length > 5 && text.length < 300) {
+                            const hasDate = /\d{1,2}[-\/]\d{1,2}/.test(text);
+                            const hasNumber = /\d+/.test(text);
+                            const hasKeyword = /销量|销售额|价格|总计|日期/.test(text);
+
+                            if (hasDate || hasKeyword) {
+                              tooltipDebug.found.push({ text: text.substring(0, 80), hasDate, hasKeyword });
+
+                              if (!tooltipText) {
+                                tooltipText = text;
                               }
                             }
                           }
-                        }
+                        } catch (e) {}
+                      }
 
-                        return JSON.stringify({ text: null, debug });
-                      })()
-                    `,
-                    returnByValue: true
-                  });
-                  if (evalResult.result?.value) {
-                    try {
-                      const parsed = JSON.parse(evalResult.result.value);
-                      tooltipText = parsed.text;
-                      // 第一次循环时记录调试信息
-                      if (i === 0) {
-                        chartDebugInfo.evalDebug = parsed.debug;
-                      }
-                    } catch(e) {
-                      tooltipText = evalResult.result.value;
+                      await chrome.debugger.sendCommand({ tabId }, 'DOM.discardSearchResults', { searchId: search.searchId }).catch(() => {});
                     }
+                  } catch (e) {
+                    tooltipDebug.selectors.push({ query, error: e.message });
                   }
-                } catch (e) {
-                  // 备用：使用 DOM.performSearch
-                  for (const selector of tooltipSelectors) {
-                    try {
-                      const tooltipSearch = await chrome.debugger.sendCommand({ tabId }, 'DOM.performSearch', {
-                        query: selector, includeUserAgentShadowDOM: true
-                      });
-                      if (tooltipSearch.resultCount > 0) {
-                        const tooltipNodes = await chrome.debugger.sendCommand({ tabId }, 'DOM.getSearchResults', {
-                          searchId: tooltipSearch.searchId, fromIndex: 0, toIndex: 3
-                        });
-                        for (const nodeId of tooltipNodes.nodeIds) {
-                          try {
-                            const htmlResult = await chrome.debugger.sendCommand({ tabId }, 'DOM.getOuterHTML', { nodeId });
-                            const text = htmlResult.outerHTML.replace(/<[^>]*>/g, ' ').trim();
-                            if (text && text.length > 3 && text.length < 200 && /\d/.test(text)) {
-                              tooltipText = text;
-                              break;
-                            }
-                          } catch (e) {}
-                        }
-                        await chrome.debugger.sendCommand({ tabId }, 'DOM.discardSearchResults', { searchId: tooltipSearch.searchId }).catch(() => {});
-                      }
-                    } catch (e) {}
-                    if (tooltipText) break;
-                  }
+
+                  if (tooltipText) break;
+                }
+
+                // 第一次循环时记录调试信息
+                if (i === 0) {
+                  chartDebugInfo.tooltipDebug = tooltipDebug;
                 }
 
                 if (tooltipText && !chartHistoryData.some(d => d.text === tooltipText)) {
