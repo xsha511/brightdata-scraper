@@ -730,7 +730,17 @@ async function extractXuanpinViaDebugger(tabId, maxRetries = 3) {
 
               chartDebugInfo.sampling = { startX, endX, y, step, numSamples };
 
-              const tooltipSelectors = ['div[style*="z-index: 9999999"]', 'div[style*="position: absolute"][style*="left:"]'];
+              // 更多 tooltip 选择器，覆盖各种可能的样式
+              const tooltipSelectors = [
+                'div[style*="z-index: 9999999"]',
+                'div[style*="z-index: 999999"]',
+                'div[style*="z-index: 99999"]',
+                'div[style*="position: absolute"][style*="pointer-events"]',
+                'div[style*="position: absolute"][style*="left:"][style*="top:"]',
+                '.echarts-tooltip',
+                '[class*="tooltip"]',
+                '[class*="Tooltip"]'
+              ];
 
               for (let i = 0; i < numSamples; i++) {
                 const x = startX + i * step;
@@ -741,31 +751,76 @@ async function extractXuanpinViaDebugger(tabId, maxRetries = 3) {
 
                 await new Promise(r => setTimeout(r, 150));
 
-                // 搜索 tooltip
+                // 使用 Runtime.evaluate 在页面上下文中查找 tooltip（可以穿透 Shadow DOM）
                 let tooltipText = null;
-                for (const selector of tooltipSelectors) {
-                  try {
-                    const tooltipSearch = await chrome.debugger.sendCommand({ tabId }, 'DOM.performSearch', {
-                      query: selector, includeUserAgentShadowDOM: true
-                    });
-                    if (tooltipSearch.resultCount > 0) {
-                      const tooltipNodes = await chrome.debugger.sendCommand({ tabId }, 'DOM.getSearchResults', {
-                        searchId: tooltipSearch.searchId, fromIndex: 0, toIndex: 3
-                      });
-                      for (const nodeId of tooltipNodes.nodeIds) {
-                        try {
-                          const htmlResult = await chrome.debugger.sendCommand({ tabId }, 'DOM.getOuterHTML', { nodeId });
-                          const text = htmlResult.outerHTML.replace(/<[^>]*>/g, ' ').trim();
-                          if (text && text.length > 3 && text.length < 200 && /\d/.test(text)) {
-                            tooltipText = text;
-                            break;
+                try {
+                  const evalResult = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+                    expression: `
+                      (function() {
+                        // 递归搜索 Shadow DOM
+                        function findTooltipInShadow(root) {
+                          // 搜索各种可能的 tooltip 选择器
+                          const selectors = [
+                            'div[style*="z-index: 9999999"]',
+                            'div[style*="z-index: 999999"]',
+                            '.echarts-tooltip',
+                            '[class*="tooltip"]',
+                            'div[style*="position: absolute"][style*="left:"][style*="top:"]'
+                          ];
+                          for (const sel of selectors) {
+                            const el = root.querySelector(sel);
+                            if (el && el.innerText && el.innerText.trim().length > 3) {
+                              const text = el.innerText.trim();
+                              // 检查是否包含日期格式 (如 12-17)
+                              if (/\\d{1,2}[-\\/]\\d{1,2}/.test(text)) {
+                                return text;
+                              }
+                            }
                           }
-                        } catch (e) {}
+                          // 搜索所有 shadow roots
+                          const allElements = root.querySelectorAll('*');
+                          for (const el of allElements) {
+                            if (el.shadowRoot) {
+                              const found = findTooltipInShadow(el.shadowRoot);
+                              if (found) return found;
+                            }
+                          }
+                          return null;
+                        }
+                        return findTooltipInShadow(document);
+                      })()
+                    `,
+                    returnByValue: true
+                  });
+                  if (evalResult.result?.value) {
+                    tooltipText = evalResult.result.value;
+                  }
+                } catch (e) {
+                  // 备用：使用 DOM.performSearch
+                  for (const selector of tooltipSelectors) {
+                    try {
+                      const tooltipSearch = await chrome.debugger.sendCommand({ tabId }, 'DOM.performSearch', {
+                        query: selector, includeUserAgentShadowDOM: true
+                      });
+                      if (tooltipSearch.resultCount > 0) {
+                        const tooltipNodes = await chrome.debugger.sendCommand({ tabId }, 'DOM.getSearchResults', {
+                          searchId: tooltipSearch.searchId, fromIndex: 0, toIndex: 3
+                        });
+                        for (const nodeId of tooltipNodes.nodeIds) {
+                          try {
+                            const htmlResult = await chrome.debugger.sendCommand({ tabId }, 'DOM.getOuterHTML', { nodeId });
+                            const text = htmlResult.outerHTML.replace(/<[^>]*>/g, ' ').trim();
+                            if (text && text.length > 3 && text.length < 200 && /\d/.test(text)) {
+                              tooltipText = text;
+                              break;
+                            }
+                          } catch (e) {}
+                        }
+                        await chrome.debugger.sendCommand({ tabId }, 'DOM.discardSearchResults', { searchId: tooltipSearch.searchId }).catch(() => {});
                       }
-                      await chrome.debugger.sendCommand({ tabId }, 'DOM.discardSearchResults', { searchId: tooltipSearch.searchId }).catch(() => {});
-                    }
-                  } catch (e) {}
-                  if (tooltipText) break;
+                    } catch (e) {}
+                    if (tooltipText) break;
+                  }
                 }
 
                 if (tooltipText && !chartHistoryData.some(d => d.text === tooltipText)) {
