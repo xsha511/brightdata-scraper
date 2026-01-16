@@ -689,69 +689,107 @@ async function extractXuanpinViaDebugger(tabId, maxRetries = 3) {
         let chartDebugInfo = { method: 'echarts_api', started: true };
         console.log('[Debugger] Starting chart extraction via ECharts API...');
 
-        // 方法1：直接调用 ECharts API 获取图表数据
+        // 方法1：在所有执行上下文中查找 ECharts 实例
         try {
-          const echartsResult = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
-            expression: `
-              (function() {
-                const result = { instances: [], data: null, error: null };
-                try {
-                  // 查找所有 ECharts 实例
-                  const charts = document.querySelectorAll('[_echarts_instance_]');
-                  result.instances = Array.from(charts).map(c => c.getAttribute('_echarts_instance_'));
+          // 启用 Runtime 以获取所有上下文
+          await chrome.debugger.sendCommand({ tabId }, 'Runtime.enable');
 
-                  if (charts.length > 0) {
-                    // 获取第一个图表的实例
-                    const chartEl = charts[0];
-                    const instanceId = chartEl.getAttribute('_echarts_instance_');
+          // 获取所有执行上下文
+          const contexts = [];
+          const contextListener = (source, method, params) => {
+            if (method === 'Runtime.executionContextCreated') {
+              contexts.push(params.context);
+            }
+          };
 
-                    // 尝试通过 echarts.getInstanceByDom 获取实例
-                    if (typeof echarts !== 'undefined') {
-                      const instance = echarts.getInstanceByDom(chartEl);
-                      if (instance) {
-                        const option = instance.getOption();
-                        result.data = {
-                          series: option.series,
-                          xAxis: option.xAxis,
-                          yAxis: option.yAxis
-                        };
+          // 遍历可能的上下文ID (1-20)，尝试找到有 echarts 的上下文
+          chartDebugInfo.contextSearch = { tried: [], found: null };
+
+          for (let ctxId = 1; ctxId <= 20; ctxId++) {
+            try {
+              const checkResult = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+                expression: `typeof echarts !== 'undefined' ? 'found' : 'not_found'`,
+                contextId: ctxId,
+                returnByValue: true
+              });
+
+              chartDebugInfo.contextSearch.tried.push({ id: ctxId, result: checkResult.result?.value });
+
+              if (checkResult.result?.value === 'found') {
+                chartDebugInfo.contextSearch.found = ctxId;
+
+                // 在这个上下文中执行 ECharts 数据提取
+                const echartsResult = await chrome.debugger.sendCommand({ tabId }, 'Runtime.evaluate', {
+                  expression: `
+                    (function() {
+                      const result = { instances: [], data: null, allCharts: [], error: null };
+                      try {
+                        // 查找所有 ECharts 实例
+                        const charts = document.querySelectorAll('[_echarts_instance_]');
+                        result.instances = Array.from(charts).map(c => c.getAttribute('_echarts_instance_'));
+
+                        // 尝试通过 echarts.getInstanceByDom
+                        for (const chartEl of charts) {
+                          try {
+                            const instance = echarts.getInstanceByDom(chartEl);
+                            if (instance) {
+                              const option = instance.getOption();
+                              const chartData = {
+                                id: chartEl.getAttribute('_echarts_instance_'),
+                                series: option.series?.map(s => ({ name: s.name, data: s.data })),
+                                xAxis: option.xAxis?.map(x => ({ data: x.data }))
+                              };
+                              result.allCharts.push(chartData);
+                              if (!result.data) {
+                                result.data = {
+                                  series: option.series,
+                                  xAxis: option.xAxis
+                                };
+                              }
+                            }
+                          } catch(e) {
+                            result.allCharts.push({ error: e.message });
+                          }
+                        }
+                      } catch(e) {
+                        result.error = e.message;
+                      }
+                      return JSON.stringify(result);
+                    })()
+                  `,
+                  contextId: ctxId,
+                  returnByValue: true
+                });
+
+                if (echartsResult.result?.value) {
+                  const parsed = JSON.parse(echartsResult.result.value);
+                  chartDebugInfo.echartsAPI = parsed;
+
+                  if (parsed.data?.series?.[0]?.data) {
+                    const seriesData = parsed.data.series[0].data;
+                    const xAxisData = parsed.data.xAxis?.[0]?.data || [];
+
+                    for (let i = 0; i < seriesData.length; i++) {
+                      const value = seriesData[i];
+                      const date = xAxisData[i] || '';
+                      if (value !== null && value !== undefined) {
+                        chartHistoryData.push({
+                          date: date,
+                          value: String(value),
+                          text: date + ': ' + value
+                        });
                       }
                     }
-
-                    // 备用：检查全局变量
-                    if (!result.data && window.__ECHARTS_INSTANCES__) {
-                      result.data = { global: Object.keys(window.__ECHARTS_INSTANCES__) };
-                    }
+                    chartDebugInfo.echartsDataPoints = chartHistoryData.length;
                   }
-                } catch(e) {
-                  result.error = e.message;
                 }
-                return JSON.stringify(result);
-              })()
-            `,
-            returnByValue: true
-          });
-
-          if (echartsResult.result?.value) {
-            const parsed = JSON.parse(echartsResult.result.value);
-            chartDebugInfo.echartsAPI = parsed;
-
-            if (parsed.data?.series?.[0]?.data) {
-              const seriesData = parsed.data.series[0].data;
-              const xAxisData = parsed.data.xAxis?.[0]?.data || [];
-
-              for (let i = 0; i < seriesData.length; i++) {
-                const value = seriesData[i];
-                const date = xAxisData[i] || '';
-                if (value !== null && value !== undefined) {
-                  chartHistoryData.push({
-                    date: date,
-                    value: String(value),
-                    text: date + ': ' + value
-                  });
-                }
+                break; // 找到后退出循环
               }
-              chartDebugInfo.echartsDataPoints = chartHistoryData.length;
+            } catch (e) {
+              // 上下文不存在或无权访问，继续尝试下一个
+              if (!e.message.includes('Cannot find context')) {
+                chartDebugInfo.contextSearch.tried.push({ id: ctxId, error: e.message });
+              }
             }
           }
         } catch (e) {
